@@ -117,6 +117,12 @@ header::after {
     transform: scale(1.05);
 }
 
+.logo img {
+    width: 24px;
+    height: 24px;
+    object-fit: contain;
+}
+
 .logo svg {
     width: 24px;
     height: 24px;
