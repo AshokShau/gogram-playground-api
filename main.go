@@ -28,13 +28,13 @@ var staticFiles embed.FS
 const mandatoryImport = "github.com/amarnathcjd/gogram/telegram"
 
 const (
-	maxCodeSize          = 50 * 1024
-	maxConcurrentBuilds  = 3
-	buildTimeout         = 120
-	rateLimitPerIP       = 5
-	maxEnvVars           = 10
-	maxEnvVarKeyLength   = 50
-	maxEnvVarValueLength = 200
+	maxCodeSize          = 200 * 1024
+	maxConcurrentBuilds  = 5
+	buildTimeout         = 180
+	rateLimitPerIP       = 20
+	maxEnvVars           = 20
+	maxEnvVarKeyLength   = 100
+	maxEnvVarValueLength = 500
 )
 
 type rateLimiter struct {
@@ -55,45 +55,34 @@ var (
 )
 
 var forbiddenPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)os\.Remove`),
 	regexp.MustCompile(`(?i)os\.RemoveAll`),
 	regexp.MustCompile(`(?i)os\.Exec`),
 	regexp.MustCompile(`(?i)exec\.Command`),
-	regexp.MustCompile(`(?i)syscall\.`),
-	regexp.MustCompile(`(?i)unsafe\.`),
-	regexp.MustCompile(`(?i)os\.Create`),
-	regexp.MustCompile(`(?i)os\.Open.*Write`),
-	regexp.MustCompile(`(?i)ioutil\.WriteFile`),
-	regexp.MustCompile(`(?i)os\.Chmod`),
-	regexp.MustCompile(`(?i)os\.Chown`),
-	regexp.MustCompile(`(?i)net\.Listen`),
-	regexp.MustCompile(`(?i)http\.ListenAndServe`),
-	regexp.MustCompile(`(?i)plugin\.`),
-	regexp.MustCompile(`(?i)reflect\.`),
-	regexp.MustCompile(`(?i)\.\.\/`),
-	regexp.MustCompile(`(?i)\/etc\/`),
-	regexp.MustCompile(`(?i)\/proc\/`),
-	regexp.MustCompile(`(?i)\/sys\/`),
-	regexp.MustCompile(`(?i)\/root\/`),
-	regexp.MustCompile(`(?i)\/home\/`),
+	regexp.MustCompile(`(?i)\/etc\/passwd`),
+	regexp.MustCompile(`(?i)\/etc\/shadow`),
 }
 
 var allowedImports = map[string]bool{
-	"fmt":                                    true,
-	"strings":                                true,
-	"time":                                   true,
-	"errors":                                 true,
-	"context":                                true,
-	"sync":                                   true,
-	"math":                                   true,
-	"sort":                                   true,
-	"strconv":                                true,
-	"bytes":                                  true,
-	"io":                                     true,
-	"os":                                     true,
-	"encoding/json":                          true,
-	"encoding/base64":                        true,
-	"github.com/amarnathcjd/gogram/telegram": true,
+	"fmt":        true,
+	"strings":    true,
+	"time":       true,
+	"errors":     true,
+	"context":    true,
+	"sync":       true,
+	"math":       true,
+	"sort":       true,
+	"strconv":    true,
+	"bytes":      true,
+	"io":         true,
+	"os":         true,
+	"encoding":   true,
+	"net":        true,
+	"crypto":     true,
+	"regexp":     true,
+	"path":       true,
+	"reflect":    true,
+	"syscall/js": true,
+	"unsafe":     true,
 }
 
 var upgrader = websocket.Upgrader{
@@ -337,7 +326,7 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	fmt.Println("[COMPILE] WebSocket connection established")
 
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	_, message, err := conn.ReadMessage()
 	if err != nil {
 		fmt.Printf("[ERROR] Failed to read message: %v\n", err)
@@ -449,10 +438,10 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fmt.Println("[COMPILE] go mod tidy completed successfully")
-	case <-time.After(60 * time.Second):
-		fmt.Println("[ERROR] go mod tidy timeout after 60s")
+	case <-time.After(120 * time.Second):
+		fmt.Println("[ERROR] go mod tidy timeout after 120s")
 		modTidy.Process.Kill()
-		sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "go mod tidy timeout after 60s"})
+		sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "go mod tidy timeout after 120s"})
 		return
 	}
 
@@ -471,9 +460,9 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 	envList := append(os.Environ(), "GOOS=js", "GOARCH=wasm")
 
 	envList = append(envList,
-		"GOMEMLIMIT=2560MiB",
-		"GOGC=50",
-		"GOMAXPROCS=1",
+		"GOMEMLIMIT=2048MiB",
+		"GOGC=100",
+		"GOMAXPROCS=2",
 	)
 
 	for key, value := range payload.EnvVars {
@@ -504,10 +493,10 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fmt.Println("[COMPILE] Compilation successful")
-	case <-time.After(90 * time.Second):
-		fmt.Println("[ERROR] Compilation timeout after 90s")
+	case <-time.After(180 * time.Second):
+		fmt.Println("[ERROR] Compilation timeout after 180s")
 		cmd.Process.Kill()
-		sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "Compilation timeout after 90s"})
+		sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "Compilation timeout after 180s"})
 		return
 	}
 
@@ -528,7 +517,16 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	fmt.Println("[COMPILE] Sending WASM binary to client...")
-	conn.WriteMessage(websocket.BinaryMessage, data)
+
+	// Set write deadline for large WASM files
+	conn.SetWriteDeadline(time.Now().Add(120 * time.Second))
+
+	if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+		fmt.Printf("[ERROR] Failed to send WASM binary: %v\n", err)
+		sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "Failed to send WASM binary: " + err.Error()})
+		return
+	}
+
 	fmt.Println("[COMPILE] Compilation request completed successfully")
 }
 
