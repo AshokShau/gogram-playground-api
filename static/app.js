@@ -200,6 +200,7 @@ func main() {
 \t\tBuild()
 
 \tcfg.UseWebSocket = true // important, to work inside browser
+\tcfg.UseWebSocketTLS = true
 \tclient, _ := tg.NewClient(cfg)
 \tclient.Conn()
 
@@ -249,7 +250,7 @@ func main() {
 \t\tBuild()
 
 \tcfg.UseWebSocket = true
-\t//cfg.UseWebSocketTLS = true
+\tcfg.UseWebSocketTLS = true
 \tclient, err := tg.NewClient(cfg)
 \tif err != nil {
 \t\tpanic(err)
@@ -286,6 +287,7 @@ func main() {
 \t\tBuild()
 
 \tcfg.UseWebSocket = true
+\tcfg.UseWebSocketTLS = true
 \tclient, err := tg.NewClient(cfg)
 \tif err != nil {
 \t\tpanic(err)
