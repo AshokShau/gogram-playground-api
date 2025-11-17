@@ -90,6 +90,7 @@ var allowedImports = map[string]bool{
 	"strconv":                                true,
 	"bytes":                                  true,
 	"io":                                     true,
+	"os":                                     true,
 	"encoding/json":                          true,
 	"encoding/base64":                        true,
 	"github.com/amarnathcjd/gogram/telegram": true,
