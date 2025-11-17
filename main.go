@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,13 +27,189 @@ var staticFiles embed.FS
 
 const mandatoryImport = "github.com/amarnathcjd/gogram/telegram"
 
+const (
+	maxCodeSize          = 50 * 1024
+	maxConcurrentBuilds  = 3
+	buildTimeout         = 120
+	rateLimitPerIP       = 5
+	maxEnvVars           = 10
+	maxEnvVarKeyLength   = 50
+	maxEnvVarValueLength = 200
+)
+
+type rateLimiter struct {
+	mu      sync.Mutex
+	clients map[string]*clientInfo
+}
+
+type clientInfo struct {
+	count     int
+	resetTime time.Time
+}
+
+var (
+	limiter = &rateLimiter{
+		clients: make(map[string]*clientInfo),
+	}
+	buildSemaphore = make(chan struct{}, maxConcurrentBuilds)
+)
+
+var forbiddenPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)os\.Remove`),
+	regexp.MustCompile(`(?i)os\.RemoveAll`),
+	regexp.MustCompile(`(?i)os\.Exec`),
+	regexp.MustCompile(`(?i)exec\.Command`),
+	regexp.MustCompile(`(?i)syscall\.`),
+	regexp.MustCompile(`(?i)unsafe\.`),
+	regexp.MustCompile(`(?i)os\.Create`),
+	regexp.MustCompile(`(?i)os\.Open.*Write`),
+	regexp.MustCompile(`(?i)ioutil\.WriteFile`),
+	regexp.MustCompile(`(?i)os\.Chmod`),
+	regexp.MustCompile(`(?i)os\.Chown`),
+	regexp.MustCompile(`(?i)net\.Listen`),
+	regexp.MustCompile(`(?i)http\.ListenAndServe`),
+	regexp.MustCompile(`(?i)plugin\.`),
+	regexp.MustCompile(`(?i)reflect\.`),
+	regexp.MustCompile(`(?i)\.\.\/`),
+	regexp.MustCompile(`(?i)\/etc\/`),
+	regexp.MustCompile(`(?i)\/proc\/`),
+	regexp.MustCompile(`(?i)\/sys\/`),
+	regexp.MustCompile(`(?i)\/root\/`),
+	regexp.MustCompile(`(?i)\/home\/`),
+}
+
+var allowedImports = map[string]bool{
+	"fmt":                                    true,
+	"strings":                                true,
+	"time":                                   true,
+	"errors":                                 true,
+	"context":                                true,
+	"sync":                                   true,
+	"math":                                   true,
+	"sort":                                   true,
+	"strconv":                                true,
+	"bytes":                                  true,
+	"io":                                     true,
+	"encoding/json":                          true,
+	"encoding/base64":                        true,
+	"github.com/amarnathcjd/gogram/telegram": true,
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
-const encryptionKey = "1234567890abcdef1234567890abcdef" // 32 bytes for AES-256
+const encryptionKey = "1234567890abcdef1234567890abcdef"
+
+func (rl *rateLimiter) checkLimit(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	client, exists := rl.clients[ip]
+
+	if !exists || now.After(client.resetTime) {
+		rl.clients[ip] = &clientInfo{
+			count:     1,
+			resetTime: now.Add(time.Minute),
+		}
+		return true
+	}
+
+	if client.count >= rateLimitPerIP {
+		return false
+	}
+
+	client.count++
+	return true
+}
+
+func validateCode(code string) error {
+
+	if len(code) > maxCodeSize {
+		return fmt.Errorf("code exceeds maximum size of %d bytes", maxCodeSize)
+	}
+
+	for _, pattern := range forbiddenPatterns {
+		if pattern.MatchString(code) {
+			return fmt.Errorf("forbidden pattern detected: %s", pattern.String())
+		}
+	}
+
+	importRegex := regexp.MustCompile(`import\s+(?:\(([^)]+)\)|"([^"]+)")`)
+	matches := importRegex.FindAllStringSubmatch(code, -1)
+
+	for _, match := range matches {
+		var imports string
+		if match[1] != "" {
+			imports = match[1]
+		} else {
+			imports = match[2]
+		}
+
+		importPaths := regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(imports, -1)
+		for _, imp := range importPaths {
+			if len(imp) > 1 {
+				importPath := imp[1]
+
+				parts := strings.Fields(importPath)
+				if len(parts) > 0 {
+					importPath = parts[len(parts)-1]
+				}
+				importPath = strings.Trim(importPath, "\"")
+
+				if !allowedImports[importPath] && !strings.HasPrefix(importPath, "github.com/amarnathcjd/gogram") {
+					return fmt.Errorf("import not allowed: %s", importPath)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateEnvVars(envVars map[string]string) error {
+	if len(envVars) > maxEnvVars {
+		return fmt.Errorf("too many environment variables (max: %d)", maxEnvVars)
+	}
+
+	for key, value := range envVars {
+		if len(key) > maxEnvVarKeyLength {
+			return fmt.Errorf("environment variable key too long: %s", key)
+		}
+		if len(value) > maxEnvVarValueLength {
+			return fmt.Errorf("environment variable value too long for key: %s", key)
+		}
+
+		if strings.ContainsAny(key, "$`;\n\r&|<>") {
+			return fmt.Errorf("invalid characters in environment variable key: %s", key)
+		}
+	}
+
+	return nil
+}
+
+func getClientIP(r *http.Request) string {
+
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		ips := strings.Split(xff, ",")
+		return strings.TrimSpace(ips[0])
+	}
+
+	xri := r.Header.Get("X-Real-IP")
+	if xri != "" {
+		return xri
+	}
+
+	ip := r.RemoteAddr
+	if colon := strings.LastIndex(ip, ":"); colon != -1 {
+		ip = ip[:colon]
+	}
+	return ip
+}
 
 func encrypt(plaintext []byte) (string, error) {
 	block, err := aes.NewCipher([]byte(encryptionKey))
@@ -132,6 +310,23 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 func compileHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("[COMPILE] New compilation request received")
+
+	clientIP := getClientIP(r)
+	if !limiter.checkLimit(clientIP) {
+		fmt.Printf("[SECURITY] Rate limit exceeded for IP: %s\n", clientIP)
+		http.Error(w, "Rate limit exceeded. Try again later.", http.StatusTooManyRequests)
+		return
+	}
+
+	select {
+	case buildSemaphore <- struct{}{}:
+		defer func() { <-buildSemaphore }()
+	default:
+		fmt.Println("[SECURITY] Too many concurrent builds")
+		http.Error(w, "Server is busy. Please try again later.", http.StatusServiceUnavailable)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Printf("[ERROR] WebSocket upgrade failed: %v\n", err)
@@ -150,7 +345,6 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Printf("[COMPILE] Message received, length: %d bytes\n", len(message))
 
-	// Parse JSON payload with code and env vars
 	var payload struct {
 		Code    string            `json:"code"`
 		EnvVars map[string]string `json:"envVars"`
@@ -172,6 +366,20 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Printf("[COMPILE] Code decrypted, length: %d bytes\n", len(sourceBytes))
 
+	sourceStr := string(sourceBytes)
+
+	if err := validateCode(sourceStr); err != nil {
+		fmt.Printf("[SECURITY] Code validation failed: %v\n", err)
+		sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "Security validation failed: " + err.Error()})
+		return
+	}
+
+	if err := validateEnvVars(payload.EnvVars); err != nil {
+		fmt.Printf("[SECURITY] Environment variable validation failed: %v\n", err)
+		sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "Invalid environment variables: " + err.Error()})
+		return
+	}
+
 	sendEncryptedJSON(conn, map[string]string{"type": "log", "message": "Code decrypted successfully"})
 
 	tmpDir, err := os.MkdirTemp("", "jxdb-compile-*")
@@ -185,7 +393,7 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 
 	sendEncryptedJSON(conn, map[string]string{"type": "log", "message": "Created temp directory: " + tmpDir})
 
-	sourceStr := ensureImport(string(sourceBytes))
+	sourceStr = ensureImport(sourceStr)
 
 	codeFile := filepath.Join(tmpDir, "code.go")
 	if err := os.WriteFile(codeFile, []byte(sourceStr), 0644); err != nil {
@@ -207,24 +415,10 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 
 	sendEncryptedJSON(conn, map[string]string{"type": "log", "message": "Initialized Go module"})
 
-	// Determine version suffix
 	version := payload.Version
 	if version == "" {
 		version = "master"
 	}
-	// versionSuffix := "@" + version
-
-	// sendEncryptedJSON(conn, map[string]string{"type": "log", "message": "Fetching gogram" + versionSuffix + "..."})
-
-	// // Run go get with version
-	// getCmd := exec.Command("go", "get", "-u", "github.com/amarnathcjd/gogram"+versionSuffix)
-	// getCmd.Dir = tmpDir
-	// var getStderr bytes.Buffer
-	// getCmd.Stderr = &getStderr
-	// if err := getCmd.Run(); err != nil {
-	// 	sendEncryptedJSON(conn, map[string]string{"type": "error", "message": "go get failed: " + getStderr.String()})
-	// 	return
-	// }
 
 	sendEncryptedJSON(conn, map[string]string{"type": "log", "message": "Running go mod tidy..."})
 	fmt.Println("[COMPILE] Starting go mod tidy...")
@@ -236,12 +430,10 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 	modTidy.Stderr = &tidyStderr
 	modTidy.Stdout = &tidyStdout
 
-	// Add GOPROXY to speed up module downloads
 	modTidy.Env = append(os.Environ(), "GOPROXY=https://proxy.golang.org,direct")
 
 	sendEncryptedJSON(conn, map[string]string{"type": "log", "message": "Executing go mod tidy command..."})
 
-	// Set a timeout for go mod tidy
 	tidyDone := make(chan error, 1)
 	go func() {
 		fmt.Println("[COMPILE] go mod tidy running...")
@@ -275,8 +467,14 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 	)
 	cmd.Dir = tmpDir
 
-	// Set environment with user-provided env vars
 	envList := append(os.Environ(), "GOOS=js", "GOARCH=wasm")
+
+	envList = append(envList,
+		"GOMEMLIMIT=2560MiB",
+		"GOGC=50",
+		"GOMAXPROCS=1",
+	)
+
 	for key, value := range payload.EnvVars {
 		if key != "" {
 			envList = append(envList, key+"="+value)
@@ -291,7 +489,6 @@ func compileHandler(w http.ResponseWriter, r *http.Request) {
 
 	sendEncryptedJSON(conn, map[string]string{"type": "log", "message": "Starting go build..."})
 
-	// Set a timeout for go build
 	buildDone := make(chan error, 1)
 	go func() {
 		fmt.Println("[COMPILE] go build executing...")
@@ -355,7 +552,6 @@ func keepAliveHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	fmt.Println("[SERVER] Starting Gogram Playground server...")
 
-	// Check if Go is installed
 	goVersion := exec.Command("go", "version")
 	output, err := goVersion.CombinedOutput()
 	if err != nil {
@@ -364,7 +560,6 @@ func main() {
 	}
 	fmt.Printf("[SERVER] %s\n", strings.TrimSpace(string(output)))
 
-	// Check GOPATH and GOCACHE
 	goPath := os.Getenv("GOPATH")
 	goCache := os.Getenv("GOCACHE")
 	fmt.Printf("[SERVER] GOPATH: %s\n", goPath)
