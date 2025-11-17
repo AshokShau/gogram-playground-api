@@ -1,0 +1,22 @@
+name: gogram-playground
+services:
+  - name: web
+    type: web
+    builder: dockerfile
+    dockerfile: Dockerfile
+    instance_type: nano
+    regions:
+      - was
+    ports:
+      - port: 10000
+        protocol: http
+    env:
+      - key: PORT
+        value: "10000"
+    health_checks:
+      - http:
+          path: /health
+          port: 10000
+    routes:
+      - path: /
+        port: 10000
