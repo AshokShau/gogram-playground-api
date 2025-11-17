@@ -390,7 +390,7 @@ h1 {
     visibility: hidden;
     transform: translateY(-10px);
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    z-index: 1000;
+    z-index: 9999;
     overflow: hidden;
 }
 
@@ -1177,6 +1177,7 @@ kbd {
         transform: translateY(-10px);
         min-width: 180px;
         max-width: calc(100vw - 2rem);
+        z-index: 9999;
     }
     
     .dropdown-menu.active {
