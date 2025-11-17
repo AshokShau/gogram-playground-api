@@ -1134,12 +1134,15 @@ kbd {
         flex-shrink: 0;
     }
     
-    .logo svg {
+    .logo img {
         width: 20px;
         height: 20px;
     }
-    
-    .status-indicator {
+
+    .logo svg {
+        width: 20px;
+        height: 20px;
+    }    .status-indicator {
         font-size: 0.65rem;
         padding: 0.25rem 0.5rem;
         white-space: nowrap;
