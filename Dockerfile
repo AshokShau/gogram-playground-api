@@ -3,14 +3,16 @@ FROM golang:1.25.3-alpine AS builder
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
-
 COPY go.mod go.sum ./
 
 RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o server -count=1 main.go
+RUN rm -rf /root/.cache/go-build && \
+    rm -rf /go/pkg/mod && \
+    CGO_ENABLED=0 GOOS=linux go build -o server main.go
+
 FROM golang:1.25.3-alpine
 
 RUN apk add --no-cache ca-certificates git
